@@ -23,10 +23,15 @@ def test_authorized_existing_cache_uses_synthetic_files_without_network(tmp_path
     assert len(m.normalize_words(json.loads(transcript.read_text())))>100
 
 
-def test_uncached_download_and_transcription_commands_are_bounded_and_reused(tmp_path,monkeypatch):
+@pytest.mark.parametrize('env_file', [True, False])
+def test_uncached_download_and_transcription_commands_are_bounded_and_reused(tmp_path,monkeypatch,env_file):
     m=load()
-    monkeypatch.setattr(m,'PROFILE',tmp_path)
-    (tmp_path/'.env').write_text('DEEPGRAM_API_KEY=synthetic-dotenv-key\n')
+    profile=tmp_path/'synthetic-profile'
+    profile.mkdir()
+    monkeypatch.setattr(m,'PROFILE',profile)
+    monkeypatch.setenv('DEEPGRAM_API_KEY','synthetic-not-a-real-key')
+    if env_file:
+        (profile/'.env').write_text('DEEPGRAM_API_KEY=synthetic-not-a-real-key\n')
     calls=[]
     cache=tmp_path/'cache'/'abcdefghijk'
     def fake_command(args,timeout=0,cwd=None):
@@ -36,6 +41,9 @@ def test_uncached_download_and_transcription_commands_are_bounded_and_reused(tmp
         if 'yt_dlp' in args:
             (cache/'source.mp4').write_bytes(b'synthetic placeholder: probe stubbed, not media evidence')
         if 'deepgram_transcribe.py' in ' '.join(args):
+            detail = store.jobs['unit']['progress_detail']
+            assert detail['stage_progress'] is None and detail['indeterminate'] is True
+            assert detail['source'] == 'transcribing'
             prefix=Path(args[args.index('--output-prefix')+1])
             prefix.with_suffix('.json').write_text(json.dumps({'words':[{'text':'fixture','start':0,'end':1}]}))
         return subprocess.CompletedProcess(args,0,b'',b'')
@@ -48,8 +56,9 @@ def test_uncached_download_and_transcription_commands_are_bounded_and_reused(tmp
     download=calls[1][0]; transcribe=calls[2][0]
     assert '--no-playlist' in download and '--ignore-config' in download
     assert '--remote-components' in download and 'ejs:github' in download
-    assert '--allow-paid-api' in transcribe and '--env-file' in transcribe
-    assert str(m.PROFILE/'.env') in transcribe
+    assert '--allow-paid-api' in transcribe
+    assert ('--env-file' in transcribe) is env_file
+    assert (str(m.PROFILE/'.env') in transcribe) is env_file
     assert all(0<t<=1800 for _,t in calls)
     m.cached_inputs(store,'unit')
     assert len(calls)==3

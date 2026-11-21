@@ -5,6 +5,58 @@
   const statusLabels = { queued: 'Dalam antrean', downloading: 'Mengunduh video', transcribing: 'Mentranskripsi audio', selecting: 'Memilih potongan', rendering: 'Merender klip', completed: 'Selesai', failed: 'Gagal' };
   const state = { jobs: [], selected: null, timer: null, polling: false, submitting: false, configured: null, rendered: null };
   let toastTimer;
+  let deleteTarget = null;
+  let deleting = false;
+  const deletable = job => job && ['completed', 'failed'].includes(job.status);
+  function closeDelete() {
+    if (deleting) return;
+    $('delete-dialog').close();
+    deleteTarget = null;
+    ($('delete-project').disabled ? $('project-select') : $('delete-project')).focus({ preventScroll: true });
+  }
+  $('delete-project').addEventListener('click', () => {
+    const job = state.jobs.find(item => item.id === state.selected);
+    if (!deletable(job)) return;
+    deleteTarget = job.id;
+    $('delete-target').textContent = job.title || 'Video YouTube';
+    $('delete-error').hidden = true;
+    $('delete-confirm').disabled = false;
+    $('delete-dialog').showModal();
+    $('delete-cancel').focus();
+  });
+  $('delete-cancel').addEventListener('click', closeDelete);
+  $('delete-dialog').addEventListener('cancel', event => { event.preventDefault(); closeDelete(); });
+  $('delete-confirm').addEventListener('click', async () => {
+    if (deleting || !deleteTarget) return;
+    const id = deleteTarget;
+    deleting = true;
+    $('delete-confirm').disabled = $('delete-cancel').disabled = true;
+    $('delete-confirm').textContent = 'Menghapus…';
+    $('delete-dialog').setAttribute('aria-busy', 'true');
+    try {
+      await api(`/api/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.jobs = state.jobs.filter(job => job.id !== id);
+      if (state.selected === id) state.selected = state.jobs[0]?.id || null;
+      renderProjects(); renderSelected();
+      deleting = false;
+      closeDelete();
+      const refreshed = await loadJobs();
+      if (!refreshed || state.jobs.some(job => job.id === id)) {
+        networkError('Permintaan hapus diterima, tetapi penghapusan belum dapat diverifikasi. Muat ulang riwayat sebelum mencoba lagi.');
+      } else toast('Proyek dihapus. Cache sumber video dan transkrip tetap disimpan.');
+    } catch (error) {
+      $('delete-error').textContent = error.message;
+      $('delete-error').hidden = false;
+      if ([404, 409].includes(error.status)) await loadJobs();
+    } finally {
+      deleting = false;
+      $('delete-confirm').disabled = !deletable(state.jobs.find(job => job.id === deleteTarget));
+      $('delete-cancel').disabled = false;
+      $('delete-project').disabled = !deletable(state.jobs.find(job => job.id === state.selected));
+      $('delete-confirm').textContent = 'Ya, hapus proyek';
+      $('delete-dialog').setAttribute('aria-busy', 'false');
+    }
+  });
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -42,7 +94,9 @@
       try { data = await response.json(); } catch { throw new Error('Respons layanan tidak terbaca. Coba muat ulang.'); }
       if (!response.ok) {
         const detail = data.message || data.error || data.detail;
-        throw new Error(typeof detail === 'string' ? detail : `Permintaan gagal (${response.status}).`);
+        const error = new Error(typeof detail === 'string' ? detail : `Permintaan gagal (${response.status}).`);
+        error.status = response.status;
+        throw error;
       }
       return data;
     } catch (error) {
@@ -78,11 +132,19 @@
     if (index < 0) state.jobs.unshift(job);
     else state.jobs[index] = job;
   }
+  let selectionCleared = false;
+  let projectSignature = null;
   function renderProjects() {
+    const signature = JSON.stringify([state.selected, state.jobs.map(job => [job.id, job.title, job.status, job.created_at])]);
+    if (signature === projectSignature) return;
+    projectSignature = signature;
     const select = $('project-select');
     select.replaceChildren();
     select.disabled = !state.jobs.length;
-    if (!state.jobs.length) select.append(element('option', '', 'Belum ada proyek'));
+    if (!state.selected || !state.jobs.length) {
+      const placeholder = element('option', '', state.jobs.length ? 'Pilih proyek dari riwayat' : 'Belum ada proyek');
+      placeholder.value = ''; placeholder.selected = true; select.append(placeholder);
+    }
     for (const job of state.jobs) {
       const option = element('option', '', [job.title || 'Video YouTube', statusLabels[job.status] || 'Status tidak dikenal', dateLabel(job.created_at)].filter(Boolean).join(' · '));
       option.value = job.id;
@@ -248,20 +310,47 @@
     card.append(shell, details);
     return card;
   }
+  function setProgress(node, value, unknownText) {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100) {
+      node.value = value;
+      node.setAttribute('aria-valuetext', `${value}%`);
+      return value;
+    }
+    node.removeAttribute('value');
+    node.setAttribute('aria-valuetext', unknownText);
+    return null;
+  }
+  function renderProgress(job) {
+    const overall = setProgress($('job-progress'), job.progress, 'Progres tahapan belum tersedia');
+    $('job-percent').textContent = overall === null ? 'Progres tahapan · belum tersedia' : `Progres tahapan · ${Math.round(overall)}%`;
+    const detail = job.progress_detail || {};
+    const stage = setProgress($('stage-progress'), detail.indeterminate ? null : detail.stage_progress, 'Persentase tahap belum tersedia');
+    const count = Number.isInteger(detail.current_clip) && detail.current_clip > 0 && Number.isInteger(detail.total_clips) && detail.total_clips >= detail.current_clip ? `Klip ${detail.current_clip}/${detail.total_clips} · ` : '';
+    $('stage-detail').textContent = `${job.status === 'rendering' ? count : ''}${stage === null ? 'Persentase tahap belum tersedia. Proses dilaporkan saat ada pembaruan.' : `${Math.round(stage * 10) / 10}% tahap saat ini`}`;
+    $('stage-status').hidden = !activeStatuses.has(job.status);
+    const steps = [['queued', 'Antrean'], ['downloading', 'Unduh'], ['transcribing', 'Transkrip'], ['selecting', 'Pilih klip'], ['rendering', 'Render'], ['completed', 'Selesai']];
+    const current = steps.findIndex(([status]) => status === job.status);
+    $('job-steps').replaceChildren(...steps.map(([status, label], index) => {
+      const node = element('li', index === current ? 'current' : index < current ? 'done' : '', `${index + 1}. ${label}`);
+      if (status === job.status) node.setAttribute('aria-current', 'step');
+      if (index < current) node.setAttribute('aria-label', `${label}, selesai`);
+      return node;
+    }));
+  }
   function renderSelected() {
     const job = state.jobs.find(item => item.id === state.selected);
+    $('delete-project').disabled = !deletable(job) || deleting;
+    $('clear-selection').disabled = !job;
     const clips = Array.isArray(job?.clips) ? job.clips : [];
     $('clip-total').textContent = String(clips.length);
     $('job-status').hidden = !job;
     $('download-all').hidden = true;
     if (job) {
-      const progress = Number.isFinite(Number(job.progress)) ? Math.max(0, Math.min(100, Number(job.progress))) : 0;
+      renderProgress(job);
       $('job-badge').textContent = statusLabels[job.status] || 'Status tidak dikenal';
       $('job-badge').className = `status-badge ${job.status === 'completed' ? 'completed' : job.status === 'failed' ? 'failed' : ''}`;
       $('job-title').textContent = job.title || 'Video YouTube';
       $('job-source').textContent = [job.channel, dateLabel(job.created_at)].filter(Boolean).join(' · ');
-      $('job-percent').textContent = `${Math.round(progress)}%`;
-      $('job-progress').value = progress;
       $('job-message').textContent = job.status === 'failed' ? (typeof job.error === 'string' ? job.error : job.message || 'Pemrosesan gagal. Periksa sumber video dan konfigurasi server sebelum membuat proyek baru.') : job.message || job.stage || statusLabels[job.status] || '';
       if (job.status === 'completed' && clips.length) {
         const zip = localURL(job.zip_url || `/api/jobs/${encodeURIComponent(job.id)}/download.zip`);
@@ -277,26 +366,89 @@
     $('empty-state').hidden = clips.length > 0;
     const emptyHeading = $('empty-state').querySelector('h3');
     const emptyText = $('empty-state').querySelector('p');
-    emptyHeading.textContent = !job ? 'Ruang untuk cerita berikutnya.' : job.status === 'failed' ? 'Proyek ini belum menghasilkan klip.' : job.status === 'completed' ? 'Tidak ada klip pada proyek ini.' : 'Videomu sedang diolah.';
-    emptyText.textContent = !job ? 'Belum ada klip. Tambahkan tautan di atas untuk memulai. Hasil asli dan subtitle akan tampil di sini setelah diproses.' : activeStatuses.has(job.status) ? 'Klip akan muncul setelah tersedia. Kamu boleh memuat ulang halaman; riwayat tersimpan di server lokal.' : 'Lihat status proyek di atas. Kamu bisa membuat proyek baru dari formulir.';
+    emptyHeading.textContent = !job ? (state.jobs.length ? 'Pilih proyek untuk melihat hasil.' : 'Belum ada proyek.') : job.status === 'failed' ? 'Pemrosesan proyek terhenti.' : job.status === 'completed' ? 'Tidak ada klip pada proyek ini.' : 'Video sedang diolah.';
+    emptyText.textContent = !job ? (state.jobs.length ? 'Riwayat tetap tersimpan. Pilih proyek dari daftar di atas, atau buat proyek baru.' : 'Tambahkan tautan video untuk membuat klip pertama. Hasil dan subtitle akan tersedia di sini.') : activeStatuses.has(job.status) ? 'Klip akan muncul setelah tersedia. Kamu boleh memuat ulang halaman; riwayat tersimpan di server lokal.' : job.status === 'failed' ? 'Periksa pesan kesalahan di atas. Klip yang sudah tersedia tetap dapat ditinjau. Kamu dapat menghapus proyek ini atau membuat proyek baru.' : 'Lihat status proyek di atas. Kamu bisa membuat proyek baru dari formulir.';
     $('empty-state').querySelector('a').hidden = !!job && activeStatuses.has(job.status);
+    syncRealtime();
+  }
+  let stream = null;
+  let realtimeId = null;
+  let transport = null;
+  let connectTimer = null;
+  let suspended = false;
+  let watchVersion = 0;
+  function stopRealtime() {
+    watchVersion++;
+    stream?.close(); stream = null;
+    clearTimeout(state.timer); state.timer = null;
+    clearTimeout(connectTimer); connectTimer = null;
+    realtimeId = null; transport = null;
+  }
+  function fallback(id) {
+    if (id !== realtimeId || suspended) return;
+    stream?.close(); stream = null;
+    clearTimeout(connectTimer); connectTimer = null;
+    transport = 'poll';
+    $('live-state').textContent = 'Mode cadangan · status diperiksa setiap 2 detik (real-time tidak tersedia).';
+    schedulePoll();
+  }
+  function syncRealtime() {
+    const job = state.jobs.find(item => item.id === state.selected);
+    if (suspended || !job || !activeStatuses.has(job.status)) {
+      stopRealtime();
+      $('live-state').textContent = job ? 'Pembaruan selesai.' : '';
+      return;
+    }
+    if (realtimeId === job.id) return;
+    stopRealtime();
+    const id = job.id;
+    realtimeId = id;
+    if (typeof EventSource === 'undefined') { fallback(id); return; }
+    transport = 'sse';
+    $('live-state').textContent = 'Menghubungkan pembaruan real-time…';
+    try {
+      const source = new EventSource(`/api/jobs/${encodeURIComponent(id)}/events`);
+      stream = source;
+      connectTimer = setTimeout(() => { if (stream === source) fallback(id); }, 10000);
+      source.addEventListener('job', event => {
+        if (stream !== source || state.selected !== id || suspended) return;
+        try {
+          const snapshot = JSON.parse(event.data);
+          if (!snapshot || snapshot.id !== id) throw new Error('Snapshot tidak valid');
+          clearTimeout(connectTimer); connectTimer = null;
+          updateJob(snapshot);
+          networkError();
+          $('live-state').textContent = 'Terhubung · pembaruan real-time';
+          renderProjects(); renderSelected();
+          syncRealtime();
+        } catch { fallback(id); }
+      });
+      source.onerror = () => { if (stream === source) fallback(id); };
+    } catch { fallback(id); }
   }
   function schedulePoll() {
-    clearTimeout(state.timer);
-    if (state.jobs.some(job => activeStatuses.has(job.status))) state.timer = setTimeout(poll, 2000);
+    if (state.timer || suspended || transport !== 'poll') return;
+    state.timer = setTimeout(() => { state.timer = null; poll(); }, 2000);
   }
   async function poll() {
-    if (state.polling) return;
+    if (state.polling || suspended || transport !== 'poll') return;
     state.polling = true;
+    const id = realtimeId;
+    const version = watchVersion;
     try {
-      await Promise.all(state.jobs.filter(job => activeStatuses.has(job.status)).map(async job => {
-        updateJob(await api(`/api/jobs/${encodeURIComponent(job.id)}`));
-      }));
-      networkError();
-      renderProjects();
-      renderSelected();
-    } catch (error) { networkError(`${error.message} Status terakhir tetap ditampilkan.`); }
-    finally { state.polling = false; schedulePoll(); }
+      const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+      if (version !== watchVersion || id !== state.selected || suspended) return;
+      updateJob(job);
+      networkError(); renderProjects(); renderSelected();
+      syncRealtime();
+    } catch (error) {
+      if (version !== watchVersion || suspended) return;
+      networkError(`${error.message} Status terakhir tetap ditampilkan.`);
+      if (error.status === 404) {
+        stopRealtime();
+        await loadJobs();
+      }
+    } finally { state.polling = false; schedulePoll(); }
   }
   async function loadJobs() {
     $('refresh-button').disabled = true;
@@ -304,18 +456,27 @@
       const data = await api('/api/jobs');
       if (!Array.isArray(data.jobs)) throw new Error('Riwayat proyek tidak valid.');
       state.jobs = data.jobs.filter(job => job && typeof job.id === 'string');
-      if (!state.jobs.some(job => job.id === state.selected)) state.selected = state.jobs[0]?.id || null;
+      if (!state.jobs.some(job => job.id === state.selected)) state.selected = selectionCleared ? null : state.jobs[0]?.id || null;
       networkError();
       renderProjects();
       renderSelected();
+      return true;
     } catch (error) {
       networkError(error.message);
       if (!state.jobs.length) { renderProjects(); renderSelected(); }
+      return false;
     } finally { $('refresh-button').disabled = false; schedulePoll(); }
   }
+  $('clear-selection').addEventListener('click', () => {
+    selectionCleared = true;
+    state.selected = null;
+    renderProjects(); renderSelected();
+    $('project-select').focus({ preventScroll: true });
+  });
   $('project-select').addEventListener('change', event => {
-    state.selected = event.target.value;
-    renderSelected();
+    selectionCleared = !event.target.value;
+    state.selected = event.target.value || null;
+    renderProjects(); renderSelected();
   });
   $('refresh-button').addEventListener('click', () => { health(); loadJobs(); });
   $('create-form').addEventListener('submit', async event => {
@@ -338,6 +499,7 @@
       const job = await api('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: source.href, clip_count: Number($('clip-count').value), language: $('language').value, layout: $('layout').value, subtitle_style: $('subtitle-style').value, render_preset: $('render-preset').value, headline: $('headline').value, rights_confirmed: $('rights').checked, paid_confirmed: $('paid').checked }) });
       updateJob(job);
       state.selected = job.id;
+      selectionCleared = false;
       renderProjects();
       renderSelected();
       schedulePoll();
@@ -348,8 +510,10 @@
     } catch (error) { $('form-message').textContent = error.message; }
     finally { state.submitting = false; updateCreateButton(); }
   });
-  window.addEventListener('pagehide', () => clearTimeout(state.timer));
-  window.addEventListener('pageshow', event => { if (event.persisted) { health(); loadJobs(); } });
+  function suspend() { suspended = true; stopRealtime(); }
+  window.addEventListener('pagehide', suspend);
+  window.addEventListener('beforeunload', suspend);
+  window.addEventListener('pageshow', event => { if (event.persisted) { suspended = false; health(); loadJobs(); } });
   health();
   loadJobs();
 })();

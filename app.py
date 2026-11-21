@@ -6,7 +6,10 @@ import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+import asyncio
+import time
+import math
 from fastapi.staticfiles import StaticFiles
 import subprocess
 import shutil
@@ -175,6 +178,7 @@ def create_app(data_dir=None, processor=None, static_dir=None, *, allow_network=
     def create_job(body: JobRequest):
         job_id = uuid.uuid4().hex
         item = dict(id=job_id, url=body.url, title='YouTube ' + youtube_id(body.url), channel='', status='queued', progress=0, stage='queued', message='Queued for local processing', created_at=datetime.now(timezone.utc).isoformat(), clips=[], **body.model_dump(exclude={'url'}))
+        item.update(progress_label='Weighted pipeline progress', progress_detail=dict(stage_progress=None, current_clip=None, total_clips=0, indeterminate=True, source='queued'))
         with store.lock:
             store.jobs[job_id] = item
             store.save()
@@ -195,6 +199,49 @@ def create_app(data_dir=None, processor=None, static_dir=None, *, allow_network=
         if job_id not in store.jobs:
             raise HTTPException(404, 'Job not found')
         return store.jobs[job_id]
+
+    @app.get('/api/jobs/{job_id}/events')
+    def events(job_id: str, request: Request):
+        with store.lock:
+            job(job_id)  # Resolve 404 before sending streaming headers.
+        return StreamingResponse(job_events(store, job_id, request), media_type='text/event-stream', headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
+
+    @app.delete('/api/jobs/{job_id}')
+    def delete_job(job_id: str):
+        with store.lock:
+            item = job(job_id)
+            if item['status'] not in {'completed', 'failed'}:
+                raise HTTPException(409, 'Active jobs cannot be deleted')
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', job_id):
+                raise HTTPException(409, 'Unsafe output directory')
+            outputs = store.root / 'outputs'
+            output = outputs / job_id
+            if outputs.is_symlink() or output.is_symlink() or (output.exists() and not output.is_dir()):
+                raise HTTPException(409, 'Unsafe output directory')
+            if output.exists() and any(p.is_symlink() for p in output.rglob('*')):
+                raise HTTPException(409, 'Unsafe output directory')
+            quarantine = outputs / ('.deleted-' + uuid.uuid4().hex)
+            moved = False
+            try:
+                if output.exists():
+                    output.rename(quarantine)
+                    moved = True
+                del store.jobs[job_id]
+                store.save()
+            except OSError:
+                store.jobs[job_id] = item
+                if moved:
+                    quarantine.rename(output)
+                raise HTTPException(500, 'Deletion could not be committed; job retained') from None
+            result = {'deleted': True, 'id': job_id, 'cache_retained': True}
+            if moved:
+                # History is committed before irreversible cleanup. Failed cleanup
+                # stays in a hidden, unservable quarantine, never in cache.
+                try:
+                    shutil.rmtree(quarantine)
+                except OSError:
+                    result['cleanup_pending'] = True
+            return result
 
     @app.post('/api/jobs/{job_id}/clips/{clip_id}/caption')
     def caption(job_id: str, clip_id: str, body: CaptionRequest):
@@ -249,9 +296,42 @@ def create_app(data_dir=None, processor=None, static_dir=None, *, allow_network=
     return app
 
 
+async def job_events(store, job_id, request, interval=0.25, heartbeat=15):
+    previous = None
+    last_sent = time.monotonic()
+    while not await request.is_disconnected():
+        # Never wait for a worker's disk write while holding the event loop.
+        if store.lock.acquire(blocking=False):
+            try:
+                item = store.jobs.get(job_id)
+                payload = json.dumps(item, ensure_ascii=False) if item is not None else None
+                final = item is None or item.get('status') in {'completed', 'failed'}
+            finally:
+                store.lock.release()
+            if payload is None:
+                return
+            if payload != previous:
+                yield 'event: job\ndata: ' + payload + '\n\n'
+                previous = payload
+                last_sent = time.monotonic()
+            if final:
+                return
+        if time.monotonic() - last_sent >= heartbeat:
+            yield ': heartbeat\n\n'
+            last_sent = time.monotonic()
+        await asyncio.sleep(interval)
+
+
 def update(store, job_id, **changes):
     with store.lock:
-        store.jobs[job_id].update(changes)
+        item = store.jobs[job_id]
+        if 'progress' in changes:
+            changes['progress'] = max(item.get('progress', 0), min(100, changes['progress']))
+        changes.setdefault('progress_label', 'Weighted pipeline progress')
+        if 'stage' in changes and 'progress_detail' not in changes:
+            final = changes['stage'] in {'completed', 'failed'}
+            changes['progress_detail'] = dict(stage_progress=100 if changes['stage'] == 'completed' else None, current_clip=None, total_clips=item.get('progress_detail', {}).get('total_clips', 0), indeterminate=not final, source=changes['stage'])
+        item.update(changes)
         store.save()
 
 
@@ -284,7 +364,56 @@ def verify_media(path):
     return checks, float(data['format']['duration'])
 
 
-def render_clip(source, words, candidate, output, layout, clip_id, subtitle_style='clean', render_preset='standard', headline='', source_credit=''):
+def render_command(args, duration, callback, timeout=900, cwd=None):
+    """Drain FFmpeg's machine progress without buffering provider/media logs."""
+    import selectors
+    import tempfile
+    started = time.monotonic()
+    last = 0.0
+    emitted = 0.0
+    pending = b''
+    with tempfile.TemporaryFile() as errors, selectors.DefaultSelector() as selector:
+        process = subprocess.Popen([str(a) for a in args], cwd=cwd, stdout=subprocess.PIPE, stderr=errors)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while selector.get_map():
+                if time.monotonic() - started >= timeout:
+                    raise subprocess.TimeoutExpired('ffmpeg', timeout)
+                for key, _ in selector.select(min(.2, max(.001, timeout - (time.monotonic() - started)))):
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    pending += chunk
+                    while b'\n' in pending:
+                        line, pending = pending.split(b'\n', 1)
+                        name, sep, value = line.partition(b'=')
+                        if sep and name in {b'out_time_us', b'out_time_ms'}:
+                            try:
+                                elapsed = float(value) / 1_000_000
+                            except ValueError:
+                                continue
+                            if not math.isfinite(elapsed) or elapsed < 0:
+                                continue
+                            last = max(last, min(1.0, elapsed / duration))
+                            now = time.monotonic()
+                            if callback and now - emitted >= .2:
+                                callback(last)
+                                emitted = now
+                    pending = pending[-8192:]
+            process.wait(timeout=max(.001, timeout - (time.monotonic() - started)))
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, 'ffmpeg')
+            if callback:
+                callback(1.0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+
+
+def render_clip(source, words, candidate, output, layout, clip_id, subtitle_style='clean', render_preset='standard', headline='', source_credit='', progress_callback=None):
     output = Path(output)
     srt = output / (clip_id+'.srt')
     video = output / (clip_id+'.mp4')
@@ -300,7 +429,7 @@ def render_clip(source, words, candidate, output, layout, clip_id, subtitle_styl
         graph = '[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280'
     # Only app-generated filenames, never a user-supplied filter/path.
     graph += f",setsar=1,ass={ass.name}[v]"
-    command(['ffmpeg','-v','error','-n','-filter_complex_threads','2','-ss',candidate['start'],'-i',Path(source).resolve(),'-t',candidate['end']-candidate['start'],'-filter_complex',graph,'-map','[v]','-map','0:a:0','-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',video.name],cwd=output,timeout=900)
+    render_command(['ffmpeg','-v','error','-nostdin','-progress','pipe:1','-n','-filter_complex_threads','2','-ss',candidate['start'],'-i',Path(source).resolve(),'-t',candidate['end']-candidate['start'],'-filter_complex',graph,'-map','[v]','-map','0:a:0','-c:v','libx264','-preset','veryfast','-crf','23','-threads','2','-pix_fmt','yuv420p','-r','30','-c:a','aac','-b:a','128k','-movflags','+faststart',video.name],candidate['end']-candidate['start'],progress_callback,cwd=output,timeout=900)
     checks, duration = verify_media(video)
     command(['ffmpeg','-v','error','-n','-ss',min(1,duration/2),'-i',video,'-frames:v','1','-threads','2',poster],timeout=30)
     return dict(candidate, id=clip_id, duration=duration, checks=checks)
@@ -338,10 +467,8 @@ def cached_inputs(store, job_id):
             raise ValueError('Source duration exceeds one hour')
         update(store,job_id,status='transcribing',stage='transcribing',progress=20,message='Sending source audio to Deepgram with explicit paid-API consent; no automatic paid retry')
         prefix=cache/('transcription-'+uuid.uuid4().hex)
-        transcription_command=[Path(sys.executable),CLIPPER/'scripts/deepgram_transcribe.py',source,'--language',item['language'],'--allow-paid-api','--output-prefix',prefix]
-        if (PROFILE/'.env').is_file():
-            transcription_command += ['--env-file',PROFILE/'.env']
-        command(transcription_command,timeout=1800)
+        env_args = ['--env-file', PROFILE/'.env'] if (PROFILE/'.env').is_file() else []
+        command([Path(sys.executable),CLIPPER/'scripts/deepgram_transcribe.py',source,'--language',item['language'],*env_args,'--allow-paid-api','--output-prefix',prefix],timeout=1800)
         produced=prefix.with_suffix('.json')
         normalize_words(json.loads(produced.read_text()))
         produced.replace(transcript)
@@ -379,10 +506,22 @@ def process_job(store, job_id):
     candidates=select_candidates(words,duration,item['clip_count'])
     output=store.root/'outputs'/job_id
     output.mkdir(parents=True,exist_ok=True)
+    total_duration = sum(c['end'] - c['start'] for c in candidates)
+    completed_duration = 0
     for i,candidate in enumerate(candidates,1):
-        update(store,job_id,status='rendering',stage='rendering',progress=40+int((i-1)/len(candidates)*50),message=f'Rendering and decoding clip {i}/{len(candidates)}')
+        clip_duration = candidate['end'] - candidate['start']
+        latest_fraction = 0.0
+        def report(fraction):
+            nonlocal latest_fraction
+            if not isinstance(fraction, (int, float)) or not math.isfinite(fraction):
+                return
+            latest_fraction = max(latest_fraction, min(1, max(0, fraction)))
+            update(store,job_id,progress=40+50*(completed_duration+clip_duration*latest_fraction)/total_duration,
+                   progress_detail=dict(stage_progress=latest_fraction*100,current_clip=i,total_clips=len(candidates),indeterminate=False,source='ffmpeg'))
+        update(store,job_id,status='rendering',stage='rendering',progress=40+50*completed_duration/total_duration,message=f'Rendering and decoding clip {i}/{len(candidates)}',progress_detail=dict(stage_progress=0,current_clip=i,total_clips=len(candidates),indeterminate=False,source='ffmpeg'))
         clip_id=f'clip-{i:02d}'
-        clip=render_clip(source,words,candidate,output,item['layout'],clip_id,subtitle_style=item.get('subtitle_style','clean'),render_preset=item.get('render_preset','standard'),headline=item.get('headline',''),source_credit='Sumber: '+(item.get('channel') or item.get('title','Video asal')))
+        clip=render_clip(source,words,candidate,output,item['layout'],clip_id,subtitle_style=item.get('subtitle_style','clean'),render_preset=item.get('render_preset','standard'),headline=item.get('headline',''),source_credit='Sumber: '+(item.get('channel') or item.get('title','Video asal')),progress_callback=report)
+        completed_duration += clip_duration
         clip['render_preset']=item.get('render_preset','standard')
         clip['ass_url']=f'/api/jobs/{job_id}/files/{clip_id}.ass'
         for field,ext in [('video_url','mp4'),('subtitle_url','srt'),('poster_url','jpg')]:

@@ -8,13 +8,14 @@ class Node {
   append(...nodes){ this.children.push(...nodes); }
   replaceChildren(...nodes){this.children=nodes;}
   setAttribute(k,v){this[k]=v;}
+  removeAttribute(k){delete this[k];}
   addEventListener(k,fn){this.events[k]=fn;}
   querySelector(selector){return walk(this).find(n=>selector.startsWith('.') ? n.className?.split(' ').includes(selector.slice(1)): n.tagName===selector)||null;}
   remove(){} focus(){} select(){} click(){return this.events.click?.({target:this});}
 }
 function walk(node){return [node,...node.children.flatMap(walk)];}
 const ids={};
-for(const id of ['network-message','create-button','health-state','project-select','copy-status','job-status','download-all','clip-total','job-badge','job-title','job-source','job-percent','job-progress','job-message','clips-grid','empty-state','refresh-button','create-form','form-message','video-url','rights','paid','clip-count','language','layout','subtitle-style']) ids[id]=new Node();
+for(const [,id] of fs.readFileSync('static/index.html','utf8').matchAll(/id="([^"]+)"/g)) ids[id]=new Node();
 ids['empty-state'].append(new Node('h3'),new Node('p'),new Node('a'));
 const job={id:'legacy',title:'Fixture',status:'completed',clips:[{id:'clip-01',title:'Data',caption:'<img src=x onerror=alert(1)> Data aktual.',start:0,end:2}]};
 let requests=[],copied='',fail=false, blobs=[];
