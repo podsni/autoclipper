@@ -29,7 +29,7 @@ def test_single_worker_serializes_jobs(tmp_path):
     assert maximum==1 and sequence==ids
 
 
-def test_cached_overlong_source_is_rejected_before_paid_transcription(tmp_path,monkeypatch):
+def test_cached_overlong_source_is_rejected_before_transcription(tmp_path,monkeypatch):
     m=load()
     from test_inputs import make_store
     cache=tmp_path/'cache'/'abcdefghijk'; cache.mkdir(parents=True)

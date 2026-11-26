@@ -27,7 +27,7 @@ function harness(jobs, {sse=true, deleteStatus=200, retainDeleted=false}={}) {
   requests.push([path,options]);let status=200,data;
   if(options.method==='DELETE'){status=deleteStatus;if(status===200){if(!retainDeleted)jobs=jobs.filter(j=>path!==`/api/jobs/${j.id}`);data={deleted:true,id:path.split('/').at(-1),cache_retained:true};}else {data={detail:status===409?'Proyek masih aktif.':'Proyek tidak ditemukan.'};if(status===404)jobs=jobs.filter(j=>path!==`/api/jobs/${j.id}`);if(status===409)jobs=jobs.map(j=>path===`/api/jobs/${j.id}`?{...j,status:'rendering'}:j);}}
   else if(path==='/api/jobs'&&options.method==='POST') {data={...JSON.parse(options.body),id:'new-job',status:'queued',clips:[]};jobs=[data,...jobs];}
-  else if(path==='/api/health') data={status:'ok',deepgram_configured:true};
+  else if(path==='/api/health') data={status:'ok',transcription_configured:true};
   else if(path==='/api/jobs')data={jobs};
   else {data=jobs.find(j=>path===`/api/jobs/${j.id}`);if(!data){status=404;data={detail:'Proyek tidak ditemukan.'};}}
   return {ok:status<400,status,json:async()=>data};
@@ -139,7 +139,7 @@ const completed={id:'done',title:'Selesai',status:'completed',progress:100,clips
  assert.equal(timeout.sources[0].closed,true);assert.match(timeout.ids['live-state'].textContent,/2 detik/);
  const create=harness([]);await tick();
  for(const [id,value] of Object.entries({'video-url':'https://youtu.be/abcdefghijk','clip-count':'3',language:'id',layout:'fit','subtitle-style':'clean','render-preset':'reference',headline:'Judul pengujian'}))create.ids[id].value=value;
- create.ids.rights.checked=create.ids.paid.checked=true;
+ create.ids.rights.checked=true;
  await create.ids['create-form'].events.submit({preventDefault(){}});await tick();
  const created=JSON.parse(create.requests.find(([p,o])=>p==='/api/jobs'&&o.method==='POST')[1].body);
  assert.equal(created.render_preset,'reference');assert.equal(created.headline,'Judul pengujian');assert.equal(created.clip_count,3);

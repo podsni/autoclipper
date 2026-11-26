@@ -15,6 +15,6 @@ def load():
 def test_health_and_durable_empty_jobs(tmp_path):
     m = load()
     with TestClient(m.create_app(tmp_path), base_url='http://localhost') as client:
-        assert client.get('/api/health').json() == {'status': 'ok', 'deepgram_configured': m.deepgram_configured()}
+        assert client.get('/api/health').json() == {'status': 'ok', 'transcription_configured': m.transcription_configured()}
         assert client.get('/api/jobs').json() == {'jobs': []}
         assert client.get('/api/jobs/missing').status_code == 404

@@ -7,3 +7,4 @@ pytest==9.2.0
 yt-dlp==2026.10.26
 pysrt==1.1.2
 python-dotenv==1.2.4
+faster-whisper==1.2.1

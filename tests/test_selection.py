@@ -25,7 +25,7 @@ def test_real_timeline_candidates_nonoverlap_and_short_speech():
     with pytest.raises(ValueError): m.normalize_words({'words': [{'text':'x','start':2,'end':1}]})
 
 
-def test_normalize_raw_deepgram_and_segment_fallback():
+def test_normalize_raw_transcript_and_segment_fallback():
     m = load()
     raw = {'results': {'channels': [{'alternatives': [{'words': [{'word':'hello','punctuated_word':'Hello.','start':0,'end':1}]}]}]}}
     assert m.normalize_words(raw)[0]['text'] == 'Hello.'

@@ -19,8 +19,7 @@ def synthetic_local_demo(tmp_path):
 
 @pytest.fixture(autouse=True)
 def no_paid_api_or_external_network(monkeypatch):
-    """Tests must never contact YouTube/Deepgram, even after a regression."""
-    monkeypatch.delenv('DEEPGRAM_API_KEY',raising=False)
+    """Tests must never contact YouTube or a paid transcription API, even after a regression."""
     original_run=subprocess.run
     def offline_run(args,*a,**kw):
         text=' '.join(str(x) for x in args) if isinstance(args,(list,tuple)) else str(args)

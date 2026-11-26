@@ -60,7 +60,6 @@ class JobRequest(BaseModel):
     render_preset: Literal['standard', 'reference'] = 'standard'
     headline: str = Field(default='', max_length=120)
     rights_confirmed: StrictBool
-    paid_confirmed: StrictBool
 
     @field_validator('url')
     @classmethod
@@ -68,11 +67,11 @@ class JobRequest(BaseModel):
         youtube_id(value)
         return value
 
-    @field_validator('rights_confirmed', 'paid_confirmed')
+    @field_validator('rights_confirmed')
     @classmethod
     def consent(cls, value):
         if not value:
-            raise ValueError('Explicit rights and paid-API consent are required')
+            raise ValueError('Explicit rights confirmation is required')
         return value
 
 ROOT = Path(__file__).resolve().parent
@@ -81,13 +80,10 @@ EXISTING = ROOT / 'examples' / 'local-demo'
 CLIPPER = ROOT / 'vendor' / 'youtube-clipper'
 
 
-def deepgram_configured():
-    if os.environ.get('DEEPGRAM_API_KEY'):
-        return True
-    env = PROFILE / '.env'
-    if not env.is_file():
-        return False
-    return any(line.strip().startswith('DEEPGRAM_API_KEY=') and bool(line.split('=', 1)[1].strip().strip('\"\'')) for line in env.read_text().splitlines())
+def transcription_configured():
+    """Local faster-whisper transcription needs no key: ready when the
+    transcriber script is present in this checkout."""
+    return (CLIPPER / 'scripts' / 'whisper_transcribe.py').is_file()
 
 
 class Store:
@@ -188,7 +184,7 @@ def create_app(data_dir=None, processor=None, static_dir=None, *, allow_network=
 
     @app.get('/api/health')
     def health():
-        return {'status': 'ok', 'deepgram_configured': deepgram_configured()}
+        return {'status': 'ok', 'transcription_configured': transcription_configured()}
 
     @app.get('/api/jobs')
     def jobs():
@@ -465,10 +461,9 @@ def cached_inputs(store, job_id):
         duration=float(probe(source)['format']['duration'])
         if not 0 < duration <= 3600:
             raise ValueError('Source duration exceeds one hour')
-        update(store,job_id,status='transcribing',stage='transcribing',progress=20,message='Sending source audio to Deepgram with explicit paid-API consent; no automatic paid retry')
+        update(store,job_id,status='transcribing',stage='transcribing',progress=20,message='Transcribing source audio locally with faster-whisper (free, no audio leaves this machine)')
         prefix=cache/('transcription-'+uuid.uuid4().hex)
-        env_args = ['--env-file', PROFILE/'.env'] if (PROFILE/'.env').is_file() else []
-        command([Path(sys.executable),CLIPPER/'scripts/deepgram_transcribe.py',source,'--language',item['language'],*env_args,'--allow-paid-api','--output-prefix',prefix],timeout=1800)
+        command([Path(sys.executable),CLIPPER/'scripts/whisper_transcribe.py',source,'--language',item['language'],'--output-prefix',prefix],timeout=1800)
         produced=prefix.with_suffix('.json')
         normalize_words(json.loads(produced.read_text()))
         produced.replace(transcript)
@@ -500,7 +495,7 @@ def process_job(store, job_id):
     duration=float(probe(source)['format']['duration'])
     if not 0 < duration <= 3600:
         raise ValueError('Source duration exceeds one hour')
-    update(store,job_id,title=metadata.get('title') or item['title'],channel=metadata.get('channel') or '',status='transcribing',stage='transcribing',progress=25,message='Reusing cached transcript; no paid API call')
+    update(store,job_id,title=metadata.get('title') or item['title'],channel=metadata.get('channel') or '',status='transcribing',stage='transcribing',progress=25,message='Reusing cached transcript; no transcription needed')
     words=normalize_words(json.loads(transcript.read_text()))
     update(store,job_id,status='selecting',stage='selecting',progress=35,message='Selecting nonoverlapping speech windows using sentence/topic-cue heuristics only')
     candidates=select_candidates(words,duration,item['clip_count'])
@@ -533,7 +528,7 @@ def process_job(store, job_id):
 
 
 def normalize_words(data):
-    """Validate normalized/Deepgram words; segment-only timing is interpolated."""
+    """Validate normalized words; segment-only timing is interpolated."""
     import math
     raw = data.get('words')
     if raw is None and 'results' in data:
@@ -651,7 +646,7 @@ def import_existing_demo(store):
         clip[field]=f'/api/jobs/{job_id}/files/clip-01.{ext}'
     store.jobs[job_id]=dict(id=job_id,url='https://www.youtube.com/watch?v=HU4I_W7qtMc',title='Existing result · AI bubble',channel='Raymond Chin',status='rendering',progress=95,stage='rendering',message='Importing actual previously rendered result',created_at=datetime.now(timezone.utc).isoformat(),clips=[clip],example=True)
     finish_archive(store,job_id)
-    update(store,job_id,message='Actual existing result imported explicitly: manual selection, previously rendered MP4 and edited SRT; verified by ffprobe and full decode. Not a new automatic selection or paid transcription.')
+    update(store,job_id,message='Actual existing result imported explicitly: manual selection, previously rendered MP4 and edited SRT; verified by ffprobe and full decode. Not a new automatic selection or transcription.')
     return store.jobs[job_id]
 
 

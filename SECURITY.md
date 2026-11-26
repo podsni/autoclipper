@@ -18,7 +18,7 @@ AutoClipper ditujukan untuk **satu ruang kerja lokal** atau akses terbatas dari 
 - `.env.example` harus tetap tanpa kredensial. Lindungi `.env` dan file password dengan izin `0600` pada filesystem Linux yang mendukungnya.
 - Jangan commit `data/`, password file, video/audio, transkrip, riwayat job, atau artefak pengujian lokal. Periksa kembali perubahan sebelum push; `.gitignore` bukan pemindai kebocoran rahasia.
 - Backup dan salinan ZIP/manifest dapat berisi informasi sumber/hasil. Batasi akses seperti data aslinya.
-- Seluruh audio sumber dikirim ke Deepgram pada transkripsi baru. Caption Groq/Gemini mengirim transkrip klip serta konteks sumber. Tinjau persetujuan subjek data dan kebijakan provider.
+- Transkripsi berjalan lokal dengan faster-whisper; audio tidak pernah dikirim ke pihak ketiga. Caption Groq/Gemini mengirim transkrip klip serta konteks sumber. Tinjau persetujuan subjek data dan kebijakan provider.
 - Menghapus proyek/output **tidak berarti cache sumber/transkrip ikut terhapus**, dan tidak menghapus data yang sudah diterima provider atau diunduh pihak lain.
 
 Jika rahasia bocor, **cabut/rotasi di provider terlebih dahulu**, hentikan akses yang terdampak, lalu bersihkan salinan dan riwayat yang relevan. Menghapus satu file atau commit baru saja tidak membatalkan key yang sudah terungkap.

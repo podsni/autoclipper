@@ -116,8 +116,8 @@
   async function health() {
     try {
       const data = await api('/api/health');
-      state.configured = data.status === 'ok' && data.deepgram_configured === true;
-      $('health-state').textContent = state.configured ? '● Layanan siap · Deepgram terhubung' : 'Deepgram belum siap. Konfigurasikan API key di server.';
+      state.configured = data.status === 'ok' && data.transcription_configured === true;
+      $('health-state').textContent = state.configured ? '● Layanan siap · Transkripsi lokal aktif' : 'Transkripsi lokal belum siap. Periksa instalasi server.';
       $('health-state').classList.toggle('warning', !state.configured);
     } catch {
       state.configured = false;
@@ -491,12 +491,12 @@
       $('video-url').focus();
       return;
     }
-    if (!$('rights').checked || !$('paid').checked) { $('form-message').textContent = 'Konfirmasi hak penggunaan dan persetujuan biaya transkripsi terlebih dahulu.'; return; }
-    if (state.configured === false) { $('form-message').textContent = 'Deepgram belum siap. Periksa konfigurasi server dan muat ulang.'; return; }
+    if (!$('rights').checked) { $('form-message').textContent = 'Konfirmasi hak penggunaan terlebih dahulu.'; return; }
+    if (state.configured === false) { $('form-message').textContent = 'Transkripsi lokal belum siap. Periksa konfigurasi server dan muat ulang.'; return; }
     state.submitting = true;
     updateCreateButton();
     try {
-      const job = await api('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: source.href, clip_count: Number($('clip-count').value), language: $('language').value, layout: $('layout').value, subtitle_style: $('subtitle-style').value, render_preset: $('render-preset').value, headline: $('headline').value, rights_confirmed: $('rights').checked, paid_confirmed: $('paid').checked }) });
+      const job = await api('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: source.href, clip_count: Number($('clip-count').value), language: $('language').value, layout: $('layout').value, subtitle_style: $('subtitle-style').value, render_preset: $('render-preset').value, headline: $('headline').value, rights_confirmed: $('rights').checked }) });
       updateJob(job);
       state.selected = job.id;
       selectionCleared = false;
